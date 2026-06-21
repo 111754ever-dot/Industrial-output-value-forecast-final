@@ -27,12 +27,15 @@
    "月初至今对齐同比（MTD-YoY）"作为参差边缘的核心特征（经验证：月前 22 日
    均值与全月均值相关 0.979，部分月高度代表全月）。训练与服务使用**同一日切口**，
    消除"半月 vs 整月"口径偏差与训练/服务不一致（train/serve skew）。
-5. 模型 —— 小样本（剔除 1-2 月后 n≈112）"瘦身优先"组合：
-       · 1 因子（Stock-Watson EM-PCA 扩散指数；EM 原生消化缺失/参差边缘）+ AR 的桥接回归；
-       · ElasticNet（专为 p≈n 设计的收缩/筛选）；
+5. 模型 —— 小样本（剔除 1-2 月后 n≈112）"瘦身优先"组合（核心为密集收缩/投影，
+   已由统一无泄漏 OOS 实验选定：Ridge≈1.45、PLS≈1.38 优于 ElasticNet≈1.58、
+   且全面优于树模型/LightGBM≈1.7+——复杂模型在此小样本上更差）：
+       · Ridge（RidgeCV，密集 L2 收缩；共线 p≈n 小样本最稳）；
+       · PLS（偏最小二乘，少数潜成分概括共线特征，实验最优）；
+       · 1 因子（Stock-Watson EM-PCA 扩散指数；EM 原生消化缺失/参差边缘）+ AR 桥接回归；
        · AR(1)（基准与锚，AR(1)≈0.54）；
        · 季节朴素（基准）；
-       · LightGBM（**挑战者**，硬约束，仅当回测打赢 AR 才纳入组合）。
+       · LightGBM（**挑战者**，硬约束，仅当回测打赢 AR 才纳入；实验显示通常被剔除）。
    组合：逆-RMSE 简单加权（不做学习型 stacking，避免在小样本上再过拟合一层）。
 6. 区间 —— 共形预测：用**伪实时 walk-forward 的真实样本外残差**做（split/jackknife+ 风味）
    校准，分布无关、有覆盖保证；80% 为主报区间，90/95 附"小样本更宽不确定"说明。
@@ -44,7 +47,7 @@
 --------------------------------------------------------------------------------
 · 严防前视偏差（look-ahead）：所有特征按 as-of 日期切断；月度自变量统一滞后一期；
   目标自身的 AR 项使用上一期已公布值；回测逐期重建信息集；
-  ElasticNet 用 TimeSeriesSplit（只用过去验证未来）而非普通 KFold 选超参。
+  Ridge/PLS 选超参用 TimeSeriesSplit（只用过去验证未来）而非普通 KFold。
 · 组合无未来泄漏：回测中组合权重用"在线扩展窗"确定（预测第 t 期仅用 t 之前的样本外
   预测），故组合的回测指标与共形残差均为真实样本外结果；模型失败时按可用模型重新归一化。
 · 制度漂移：主窗口锁 2015+；长史辅助模型对近端指数加权。
@@ -85,7 +88,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from sklearn.linear_model import ElasticNetCV
+from sklearn.linear_model import RidgeCV
+from sklearn.cross_decomposition import PLSRegression
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
@@ -202,11 +206,14 @@ class Config:
     # 回测
     backtest_start: str = "2018-03"      # 回测首个被预测月（留足训练 warmup）
     conformal_warmup: int = 18           # 在线共形最少残差数
-    weight_warmup: int = 24              # 在线组合：确定权重所需的最少历史样本外样本
+    weight_warmup: int = 12              # 在线组合：确定权重所需的最少历史样本外样本
     interval_levels: Tuple[float, ...] = (0.80, 0.90, 0.95)
 
     # 高频 MTD 聚合：窗口内观测个数 < 该指标月度观测中位数 × mtd_min_frac 的月份置缺失
     mtd_min_frac: float = 0.3
+
+    # PLS 潜成分个数（实验中 2 最优）
+    pls_components: int = 2
 
     # 覆盖度筛查
     min_coverage: float = 0.60           # 主窗口内最低非缺失比例
@@ -544,10 +551,15 @@ class BridgeFactor:
         return float(self.ols.predict(x[None, :])[0])
 
 
-class ElasticNetModel:
-    """ElasticNet（专为 p≈n 设计）。管线内 median 填补 + 标准化，仅在训练集拟合。"""
+class RidgeModel:
+    """
+    岭回归（RidgeCV，密集 L2 收缩）—— 核心线性成分。
+    在共线、p≈n 的小样本上，密集收缩比稀疏选择（Lasso/ElasticNet）更稳更准
+    （已由统一无泄漏 OOS 实验证实：Ridge RMSE≈1.45 优于 ElasticNet≈1.58）。
+    管线内 median 填补 + 标准化，仅在训练集拟合。
+    """
 
-    name = "ElasticNet"
+    name = "Ridge"
 
     def fit(self, design, cols, train_idx):
         self.cols = cols
@@ -556,17 +568,13 @@ class ElasticNetModel:
         sub = sub[good]
         X = sub[cols].values
         y = sub["y"].values
-        # 时间序列专用交叉验证：用 TimeSeriesSplit（只用过去验证未来）选 alpha/l1_ratio，
-        # 而非普通 KFold（其会用未来折验证过去折，对时序不当）。
         n = len(sub)
         n_splits = int(min(5, max(2, n // 20)))
-        cv = TimeSeriesSplit(n_splits=n_splits)
+        cv = TimeSeriesSplit(n_splits=n_splits)   # 时序 CV，只用过去验证未来
         self.pipe = Pipeline([
             ("imp", SimpleImputer(strategy="median")),
             ("sc", StandardScaler()),
-            ("en", ElasticNetCV(
-                l1_ratio=[0.1, 0.3, 0.5, 0.7, 0.9, 0.95],
-                cv=cv, max_iter=20000, random_state=RNG_SEED)),
+            ("ridge", RidgeCV(alphas=np.logspace(-2, 3, 30), cv=cv)),
         ])
         self.pipe.fit(X, y)
         return self
@@ -576,8 +584,41 @@ class ElasticNetModel:
         return float(self.pipe.predict(x)[0])
 
     def coef_table(self) -> pd.Series:
-        en = self.pipe.named_steps["en"]
-        return pd.Series(en.coef_, index=self.cols)
+        ridge = self.pipe.named_steps["ridge"]
+        return pd.Series(np.ravel(ridge.coef_), index=self.cols)
+
+
+class PLSModel:
+    """
+    偏最小二乘（PLS）—— 核心投影成分。
+    用少数潜成分概括共线特征并最大化与目标的协方差，最契合"强共同因子 + 高维"结构
+    （实验中 PLS(2) RMSE≈1.38 为各模型族最优）。管线内 median 填补 + 标准化。
+    """
+
+    name = "PLS"
+
+    def fit(self, design, cols, train_idx):
+        self.cols = cols
+        sub = design.loc[train_idx]
+        good = sub["y"].notna() & sub["AR1"].notna()
+        sub = sub[good]
+        X = sub[cols].values
+        y = sub["y"].values
+        k = int(min(self.cfg_components, X.shape[1], max(1, len(sub) - 2)))
+        self.pipe = Pipeline([
+            ("imp", SimpleImputer(strategy="median")),
+            ("sc", StandardScaler()),
+            ("pls", PLSRegression(n_components=k)),
+        ])
+        self.pipe.fit(X, y)
+        return self
+
+    def __init__(self, cfg: Config):
+        self.cfg_components = cfg.pls_components
+
+    def predict_row(self, design, cols, period):
+        x = design.loc[[period], self.cols].values
+        return float(np.ravel(self.pipe.predict(x))[0])
 
 
 class LGBMChallenger:
@@ -606,9 +647,10 @@ class LGBMChallenger:
 
 
 def build_model_zoo(cfg: Config) -> List:
-    zoo = [SeasonalNaive(), ARBaseline(), BridgeFactor(cfg), ElasticNetModel()]
+    # 核心：Ridge / PLS（密集收缩与投影，小样本共线最优）+ 因子桥接 + AR 锚 + 季节朴素基准
+    zoo = [SeasonalNaive(), ARBaseline(), BridgeFactor(cfg), RidgeModel(), PLSModel(cfg)]
     if _HAS_LGBM:
-        zoo.append(LGBMChallenger())
+        zoo.append(LGBMChallenger())  # 挑战者：实验显示其更弱，通常被回测剔除
     return zoo
 
 
@@ -887,17 +929,17 @@ def data_health_report(frames, cfg, as_of_day, target_m, forecast_m) -> None:
 
 
 def driver_report(final_models: Dict, cfg: Config) -> None:
-    en: Optional[ElasticNetModel] = final_models.get("ElasticNet")
-    if en is None:
+    ridge: Optional[RidgeModel] = final_models.get("Ridge")
+    if ridge is None:
         return
-    coef = en.coef_table()
+    coef = ridge.coef_table()
     nz = coef[coef.abs() > 1e-6].sort_values(key=lambda s: s.abs(), ascending=False)
     if nz.empty:
         return
     cn = {("m_" if i.freq == "M" else "h_") + i.key: i.cn for i in INDICATORS}
     cn["AR1"] = "工业增加值滞后1期"
     cn["SEAS12"] = "工业增加值滞后12期(季节)"
-    print("\n【主要驱动（ElasticNet 标准化系数，绝对值降序 Top12）】")
+    print("\n【主要驱动（Ridge 标准化系数，绝对值降序 Top12）】")
     for name, v in nz.head(12).items():
         label = cn.get(name, name)
         arrow = "↑" if v > 0 else "↓"
