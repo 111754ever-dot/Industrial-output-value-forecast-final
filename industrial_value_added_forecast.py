@@ -43,12 +43,16 @@
 时间序列局限性的处理（务必知悉）
 --------------------------------------------------------------------------------
 · 严防前视偏差（look-ahead）：所有特征按 as-of 日期切断；月度自变量统一滞后一期；
-  目标自身的 AR 项使用上一期已公布值。回测逐期重建信息集。
+  目标自身的 AR 项使用上一期已公布值；回测逐期重建信息集；
+  ElasticNet 用 TimeSeriesSplit（只用过去验证未来）而非普通 KFold 选超参。
+· 组合无未来泄漏：回测中组合权重用"在线扩展窗"确定（预测第 t 期仅用 t 之前的样本外
+  预测），故组合的回测指标与共形残差均为真实样本外结果；模型失败时按可用模型重新归一化。
 · 制度漂移：主窗口锁 2015+；长史辅助模型对近端指数加权。
 · 小样本：强正则、降维（单因子）、简单组合、共形区间；复杂件须经回测挣得入选资格。
-· 组合权重在全回测样本上确定，对回测自身略有乐观偏差（已在报告中说明），
-  这是小样本下的务实取舍，不夸大点预测增益——本脚本的核心价值在"校准区间 +
-  透明驱动 + 严谨回测"。
+· 数据口径限制（务必知悉）：本仓库仅有单一 vintage 快照，历史高频/月度值可能已被
+  修订，故回测为"伪实时（pseudo-real-time）"——能准确复现"发布时点的参差边缘"，
+  但用的是修订后数值；要做"真实时（true real-time）"需接入 point-in-time 历史档案。
+  本脚本核心价值在"校准区间 + 透明驱动 + 严谨（无泄漏）回测"，不夸大点预测增益。
 
 依赖
 ----
@@ -82,6 +86,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from sklearn.linear_model import ElasticNetCV
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
@@ -119,6 +124,7 @@ class Indicator:
     freq: str           # 'M'（月度）或 'HF'（旬/周/日 高频）
     transform: str      # 'asis' | 'cum_yoy' | 'yoy' | 'mtd_yoy'
     cn: str             # 中文简称（用于报告展示）
+    agg: str = "mean"   # 高频聚合口径：'mean'(率/价/指数/日均) | 'sum'(可加流量/总量)
 
 
 # ---- 指标字典：每个指标都显式标注，杜绝模糊匹配；相似指标已分别建唯一 key ----
@@ -148,9 +154,9 @@ INDICATORS: List[Indicator] = [
     Indicator("tire_fullsteel",    "中国:开工率:汽车轮胎(全钢胎)",              "周度", "HF", "mtd_yoy", "全钢胎开工"),
     Indicator("polyester_chip",    "中国:开工率:聚酯切片",                     "周度", "HF", "mtd_yoy", "聚酯切片开工"),
     Indicator("asphalt",           "中国:开工率:石油沥青装置",                  "周度", "HF", "mtd_yoy", "石油沥青开工"),
-    Indicator("rebar_output",      "中国:产量:螺纹钢:主要钢厂",                 "周度", "HF", "mtd_yoy", "螺纹钢产量"),
+    Indicator("rebar_output",      "中国:产量:螺纹钢:主要钢厂",                 "周度", "HF", "mtd_yoy", "螺纹钢产量", agg="sum"),
     Indicator("rebar_oprate",      "中国:开工率:螺纹钢:主要钢厂",               "周度", "HF", "mtd_yoy", "螺纹钢开工"),
-    Indicator("land_area",         "中国:100大中城市:成交土地占地面积",          "周度", "HF", "mtd_yoy", "成交土地面积"),
+    Indicator("land_area",         "中国:100大中城市:成交土地占地面积",          "周度", "HF", "mtd_yoy", "成交土地面积", agg="sum"),
     Indicator("scfi",              "中国:上海出口集装箱运价指数:综合指数",        "周度", "HF", "mtd_yoy", "SCFI综合"),
     Indicator("steel_priceidx",    "中国:钢材综合价格指数",                    "周度", "HF", "mtd_yoy", "钢材价格指数"),
     Indicator("coal_south",        "中国:南方电厂:日耗量:煤炭",                 "周度", "HF", "mtd_yoy", "南方电厂煤耗"),
@@ -166,14 +172,14 @@ INDICATORS: List[Indicator] = [
 
     # ---------------- 日度（高频 → MTD 同比） ----------------
     Indicator("pta",               "中国:开工率:精对苯二甲酸",                  "日度", "HF", "mtd_yoy", "PTA开工"),
-    Indicator("home_sales30",      "中国:30大中城市:成交面积:商品房",            "日度", "HF", "mtd_yoy", "30城商品房成交"),
+    Indicator("home_sales30",      "中国:30大中城市:成交面积:商品房",            "日度", "HF", "mtd_yoy", "30城商品房成交", agg="sum"),
     Indicator("bdi",               "波罗的海干散货指数(BDI)",                   "日度", "HF", "mtd_yoy", "BDI"),
     Indicator("nanhua",            "南华综合指数",                            "日度", "HF", "mtd_yoy", "南华综合指数"),
     Indicator("rebar_price",       "中国:价格:螺纹钢(HRB400E,20mm)",          "日度", "HF", "mtd_yoy", "螺纹钢价格"),
     Indicator("cement_priceidx",   "中国:水泥价格指数",                        "日度", "HF", "mtd_yoy", "水泥价格指数"),
-    Indicator("port_qhd",          "中国:秦皇岛港:港口吞吐量:煤炭",             "日度", "HF", "mtd_yoy", "秦皇岛港煤炭"),
-    Indicator("port_cfd",          "中国:曹妃甸港:煤炭调度:港口吞吐量",          "日度", "HF", "mtd_yoy", "曹妃甸港煤炭"),
-    Indicator("port_jt",           "中国:京唐老港:港口吞吐量:煤炭",             "日度", "HF", "mtd_yoy", "京唐老港煤炭"),
+    Indicator("port_qhd",          "中国:秦皇岛港:港口吞吐量:煤炭",             "日度", "HF", "mtd_yoy", "秦皇岛港煤炭", agg="sum"),
+    Indicator("port_cfd",          "中国:曹妃甸港:煤炭调度:港口吞吐量",          "日度", "HF", "mtd_yoy", "曹妃甸港煤炭", agg="sum"),
+    Indicator("port_jt",           "中国:京唐老港:港口吞吐量:煤炭",             "日度", "HF", "mtd_yoy", "京唐老港煤炭", agg="sum"),
 ]
 
 
@@ -196,7 +202,11 @@ class Config:
     # 回测
     backtest_start: str = "2018-03"      # 回测首个被预测月（留足训练 warmup）
     conformal_warmup: int = 18           # 在线共形最少残差数
+    weight_warmup: int = 24              # 在线组合：确定权重所需的最少历史样本外样本
     interval_levels: Tuple[float, ...] = (0.80, 0.90, 0.95)
+
+    # 高频 MTD 聚合：窗口内观测个数 < 该指标月度观测中位数 × mtd_min_frac 的月份置缺失
+    mtd_min_frac: float = 0.3
 
     # 覆盖度筛查
     min_coverage: float = 0.60           # 主窗口内最低非缺失比例
@@ -258,11 +268,21 @@ def _to_month_series(df: pd.DataFrame, name: str, as_of: pd.Timestamp) -> pd.Ser
     return s[~s.index.duplicated(keep="last")]
 
 
-def _mtd_yoy(df: pd.DataFrame, name: str, as_of: pd.Timestamp, as_of_day: int) -> pd.Series:
+def _mtd_yoy(df: pd.DataFrame, name: str, as_of: pd.Timestamp, as_of_day: int,
+             agg: str = "mean", min_frac: float = 0.3) -> pd.Series:
     """
     高频指标 → "月初至今对齐同比（MTD-YoY）"，Period[M] 索引。
-    口径：每个自然月取『1 号至 as_of_day 号』的日均水平，再与去年同月同一日切口比较。
-    训练与服务使用同一 as_of_day，确保口径一致、无前视偏差。
+    口径：每个自然月取『1 号至 as_of_day 号』窗口内的聚合，再与去年同月同一日切口比较。
+
+    聚合方式由各指标显式声明（Indicator.agg），不再"一刀切取均值"：
+      · 'mean' —— 用于率/价/指数/日均型（开工率、价格指数、BDI、日均产量/销量等）：
+                  取窗口内观测的均值（= 平均日/周强度），对窗口内观测个数差异稳健。
+      · 'sum'  —— 用于可加的流量/总量型（成交面积、成交土地、港口吞吐量等）：
+                  取窗口内求和（月度总量口径）。两年同用 [1..as_of_day] 同一日切口，
+                  使 YoY 比较口径一致。
+    口径稳健性保护：窗口内观测个数过少的月份（< 该指标月度观测中位数的 min_frac，
+    且 < 1）置为缺失，避免"薄窗口 vs 去年整窗"的口径偏差污染 YoY。
+    训练/服务/回测共用同一 as_of_day，确保无前视偏差。
     """
     sub = df.loc[df["date"] <= as_of, ["date", name]].dropna().copy()
     if sub.empty:
@@ -272,7 +292,12 @@ def _mtd_yoy(df: pd.DataFrame, name: str, as_of: pd.Timestamp, as_of_day: int) -
     if sub.empty:
         return pd.Series(dtype=float)
     sub["ym"] = sub["date"].dt.to_period("M")
-    monthly = sub.groupby("ym")[name].mean()  # 日均水平（对求和型同样稳健，避免天数差异）
+    grp = sub.groupby("ym")[name]
+    monthly = grp.sum() if agg == "sum" else grp.mean()
+    counts = grp.size()
+    typical = counts.median() if len(counts) else 1.0
+    floor = max(1, int(np.ceil(min_frac * typical)))
+    monthly = monthly.where(counts >= floor)         # 观测过少的月份置缺失
     monthly = monthly.sort_index()
     full = monthly.reindex(pd.period_range(monthly.index.min(), monthly.index.max(), freq="M"))
     yoy = (full / full.shift(12) - 1.0) * 100.0
@@ -325,7 +350,8 @@ def build_design(frames: Dict[str, pd.DataFrame], cfg: Config,
                 s = raw
             out["m_" + ind.key] = s.reindex(idx).shift(1)  # 月度统一滞后一期
         else:  # 高频
-            s = _mtd_yoy(df, ind.name, as_of, as_of_day)
+            s = _mtd_yoy(df, ind.name, as_of, as_of_day,
+                         agg=ind.agg, min_frac=cfg.mtd_min_frac)
             out["h_" + ind.key] = s.reindex(idx)            # 当月 MTD（不滞后）
     return out
 
@@ -497,25 +523,20 @@ class BridgeFactor:
         self.ind_cols = ind_cols
         self.factor = EMFactor(self.cfg.n_factors, self.cfg.factor_max_iter,
                                self.cfg.factor_tol).fit(sub[ind_cols].values)
-        F = self.factor.factors_
-        # 因子符号对齐：使第一因子与 y 正相关，便于解释
-        y = sub["y"].values
-        if np.corrcoef(F[:, 0], y)[0, 1] < 0:
-            F[:, 0] *= -1
-            self.factor.loadings_[0] *= -1
-            self.flip0 = True
-        else:
-            self.flip0 = False
+        F = self.factor.factors_.copy()
+        # 因子符号对齐：将符号一次性写入载荷（loadings_），使 transform_row 产出的
+        # 因子方向与训练时一致；predict_row 不再二次翻转，避免符号被重复翻转。
+        sign0 = 1.0 if np.corrcoef(F[:, 0], y)[0, 1] >= 0 else -1.0
+        self.factor.loadings_[0] *= sign0
+        F[:, 0] *= sign0
         Xreg = np.column_stack([F, sub["AR1"].values])
         self.ols = _OLS().fit(Xreg, y)
         return self
 
     def predict_row(self, design, cols, period):
         row = design.loc[period, self.ind_cols].values.astype(float)
+        # transform_row 已基于含符号的载荷计算，方向与训练一致，不再翻转
         f = self.factor.transform_row(row)
-        if self.flip0:
-            f = f.copy()
-            f[0] *= -1
         ar1 = design.at[period, "AR1"]
         if not np.isfinite(ar1):
             ar1 = design.loc[design["AR1"].notna(), "AR1"].iloc[-1]
@@ -535,12 +556,17 @@ class ElasticNetModel:
         sub = sub[good]
         X = sub[cols].values
         y = sub["y"].values
+        # 时间序列专用交叉验证：用 TimeSeriesSplit（只用过去验证未来）选 alpha/l1_ratio，
+        # 而非普通 KFold（其会用未来折验证过去折，对时序不当）。
+        n = len(sub)
+        n_splits = int(min(5, max(2, n // 20)))
+        cv = TimeSeriesSplit(n_splits=n_splits)
         self.pipe = Pipeline([
             ("imp", SimpleImputer(strategy="median")),
             ("sc", StandardScaler()),
             ("en", ElasticNetCV(
                 l1_ratio=[0.1, 0.3, 0.5, 0.7, 0.9, 0.95],
-                cv=5, max_iter=20000, random_state=RNG_SEED)),
+                cv=cv, max_iter=20000, random_state=RNG_SEED)),
         ])
         self.pipe.fit(X, y)
         return self
@@ -656,27 +682,58 @@ def walk_forward(frames: Dict[str, pd.DataFrame], cfg: Config,
     return bt
 
 
-def compute_weights(bt: pd.DataFrame, cfg: Config) -> Dict[str, float]:
-    """逆-RMSE 加权：仅纳入回测 RMSE ≤ AR 基准的模型（AR 始终合格）。不做学习型 stacking。"""
-    names = [n for n in bt.attrs["model_names"] if n != SeasonalNaive.name]
+def compute_weights(df: pd.DataFrame, model_names: List[str], cfg: Config) -> Dict[str, float]:
+    """
+    逆-RMSE 加权：仅纳入 RMSE ≤ AR 基准的模型（AR 始终合格）。不做学习型 stacking。
+    df 仅应包含"用于确定权重的历史样本外预测"（在线回测中为当前预测点之前的所有点），
+    以杜绝用未来结果选择权重的泄漏。
+    """
+    names = [n for n in model_names if n != SeasonalNaive.name]
     rmse = {}
     for n in names:
-        e = (bt[n] - bt["actual"]).dropna()
+        if n not in df:
+            continue
+        e = (df[n] - df["actual"]).dropna()
         rmse[n] = float(np.sqrt((e ** 2).mean())) if len(e) else np.inf
     ar = rmse.get(ARBaseline.name, np.inf)
     eligible = {n: r for n, r in rmse.items() if r <= ar + 1e-9 and np.isfinite(r)}
     if not eligible:
-        eligible = {ARBaseline.name: ar}
+        eligible = {ARBaseline.name: ar if np.isfinite(ar) else 1.0}
     inv = {n: 1.0 / max(r, 1e-6) for n, r in eligible.items()}
     tot = sum(inv.values())
     return {n: v / tot for n, v in inv.items()}
 
 
-def ensemble_series(bt: pd.DataFrame, weights: Dict[str, float]) -> pd.Series:
-    acc = pd.Series(0.0, index=bt.index)
+def _weighted_point(weights: Dict[str, float], preds: Dict[str, float]) -> float:
+    """按权重合成点预测，并对"缺失/失败的模型"重新归一化（不被静默降权）。"""
+    num, den = 0.0, 0.0
     for n, w in weights.items():
-        acc = acc + w * bt[n]
-    return acc
+        v = preds.get(n, np.nan)
+        if np.isfinite(v):
+            num += w * v
+            den += w
+    return num / den if den > 0 else np.nan
+
+
+def online_ensemble(bt: pd.DataFrame, cfg: Config) -> Tuple[pd.Series, List[Dict[str, float]]]:
+    """
+    真正样本外的组合路径：预测第 t 期时，组合权重只用 t 之前的样本外预测确定
+    （扩展窗），权重不足 warmup 期时回退到 AR 基准。每期对可用模型重新归一化。
+    这样回测组合指标与共形残差均为无泄漏的样本外结果。
+    """
+    model_names = bt.attrs["model_names"]
+    ens = pd.Series(index=bt.index, dtype=float)
+    path: List[Dict[str, float]] = []
+    for i, p in enumerate(bt.index):
+        past = bt.iloc[:i]
+        if past["actual"].notna().sum() >= cfg.weight_warmup:
+            w = compute_weights(past, model_names, cfg)
+        else:
+            w = {ARBaseline.name: 1.0}
+        preds = {n: bt.at[p, n] for n in model_names if n in bt}
+        ens[p] = _weighted_point(w, preds)
+        path.append(w)
+    return ens, path
 
 
 # =============================================================================
@@ -867,8 +924,10 @@ def run(cfg: Config) -> Dict:
     bt = walk_forward(frames, cfg, as_of_day, target_m)
     if len(bt) < cfg.conformal_warmup + 5:
         print(f"  警告：回测样本仅 {len(bt)} 期，结果与区间可靠性下降。")
-    weights = compute_weights(bt, cfg)
-    ens = ensemble_series(bt, weights)
+    # 组合采用"在线扩展窗"权重：每期权重只用其之前的样本外预测确定 → 无未来信息泄漏。
+    ens, _ = online_ensemble(bt, cfg)
+    # 全样本权重仅用于"最终对下一期"的预测（相对预测目标而言全部为过去，合法）。
+    final_weights = compute_weights(bt, bt.attrs["model_names"], cfg)
 
     # 指标
     def _metrics(pred: pd.Series) -> Tuple[float, float, float]:
@@ -881,20 +940,21 @@ def run(cfg: Config) -> Dict:
         return rmse, mae, dacc
 
     print(f"  回测区间: {bt.index.min()} ~ {bt.index.max()}  共 {len(bt)} 期（非 1-2 月）")
-    print(f"  {'模型':<22s}{'RMSE':>8}{'MAE':>8}{'方向准确率':>12}{'入选权重':>10}")
+    print(f"  各模型为逐期样本外预测；组合为在线扩展窗权重（无未来泄漏）。")
+    print(f"  {'模型':<22s}{'RMSE':>8}{'MAE':>8}{'方向准确率':>12}{'最终权重':>10}")
     print("  " + "-" * 60)
     for n in bt.attrs["model_names"]:
         rmse, mae, dacc = _metrics(bt[n])
-        w = weights.get(n)
+        w = final_weights.get(n)
         wtxt = f"{w:.2f}" if w else "—"
         print(f"  {n:<22s}{rmse:>8.2f}{mae:>8.2f}{dacc:>11.0%}{wtxt:>10}")
     ermse, emae, edacc = _metrics(ens)
     print("  " + "-" * 60)
-    print(f"  {'★ 组合(Ensemble)':<22s}{ermse:>8.2f}{emae:>8.2f}{edacc:>11.0%}{'':>10}")
+    print(f"  {'★ 组合(在线OOS)':<22s}{ermse:>8.2f}{emae:>8.2f}{edacc:>11.0%}{'':>10}")
     ar_rmse = _metrics(bt[ARBaseline.name])[0]
     impr = (ar_rmse - ermse) / ar_rmse * 100 if ar_rmse > 0 else 0
     print(f"  组合相对 AR 基准 RMSE 改进: {impr:+.1f}%  "
-          f"（小样本下温和提升属正常；价值更在区间与驱动）")
+          f"（在线OOS口径；小样本下温和提升属正常，价值更在区间与驱动）")
 
     # ---- 覆盖率（在线共形） ----
     coverage = online_coverage(ens, bt["actual"], cfg)
@@ -932,7 +992,10 @@ def run(cfg: Config) -> Dict:
 
     is_janfeb = forecast_m.month in cfg.exclude_months
     if not is_janfeb:
-        point = sum(weights[n] * point_by_model[n] for n in weights if n in point_by_model)
+        # 按最终权重合成，并对失败/缺失的模型重新归一化（_weighted_point 内部处理）
+        point = _weighted_point(final_weights, point_by_model)
+        if not np.isfinite(point):
+            point = point_by_model.get(ARBaseline.name, np.nan)
     else:
         # 1-2 月走"春节口径参考"路径：以 AR + 因子简单平均，并显著加宽区间
         cand = [point_by_model.get(BridgeFactor.name), point_by_model.get(ARBaseline.name)]
@@ -949,7 +1012,7 @@ def run(cfg: Config) -> Dict:
 
     print(f"\n  点预测：{point:.2f}%")
     for n in sorted(point_by_model, key=lambda k: k):
-        w = weights.get(n)
+        w = final_weights.get(n)
         wt = f"(权重{w:.2f})" if w else "(未入组合)"
         print(f"      · {n:<22s} {point_by_model[n]:6.2f}%  {wt}")
     print("\n  区间预测（共形）：")
@@ -965,7 +1028,7 @@ def run(cfg: Config) -> Dict:
 
     # ---- 绘图与落盘 ----
     p1 = plot_backtest(bt, ens, cfg, forecast_m, point, final_intervals)
-    p2 = plot_models_and_coverage(bt, weights, coverage, cfg)
+    p2 = plot_models_and_coverage(bt, final_weights, coverage, cfg)
 
     # 结果表落盘
     bt_out = bt.copy()
