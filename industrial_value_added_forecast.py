@@ -16,9 +16,9 @@
 --------------------------------------------------------------------------------
 1. 问题本质 —— 混频 + 参差不齐边缘（ragged-edge）的"临近预测/Nowcasting"：
    预测当月时，月度自变量滞后约一个月，而旬/周/日度自变量已部分到位。
-2. 样本与窗口 —— 主窗口 2015 年至今（现行因子-目标关系最一致）；
-   长史（2005+）仅作辅助/稳健参照，并对近端加权（在长史 OLS 中按时间指数加权），
-   以消化已证实的"制度漂移"（PPI 同比解释力 0.57→0.01；社零 0.26→0.77）。
+2. 样本与窗口 —— 训练窗口锁定 2015 年至今。因已证实存在"制度漂移"（PPI 同比对工增的
+   解释力 0.57→0.01、社零 0.26→0.77），更早的长史关系已不适用，故不纳入更早样本，
+   而非用其拟合（避免引入失效关系）。
 3. 1-2 月特殊处理 —— Wind 的"1-2 月拆分"值为人工拆分、噪声极大（拆分月标准差
    约 16 vs 其余月约 1.9），主模型训练时**剔除 1、2 月**；但仍逐月给出当月点+区间，
    1-2 月走独立"春节口径参考"路径并显著加宽区间。
@@ -50,8 +50,9 @@
   Ridge/PLS 选超参用 TimeSeriesSplit（只用过去验证未来）而非普通 KFold。
 · 组合无未来泄漏：回测中组合权重用"在线扩展窗"确定（预测第 t 期仅用 t 之前的样本外
   预测），故组合的回测指标与共形残差均为真实样本外结果；模型失败时按可用模型重新归一化。
-· 制度漂移：主窗口锁 2015+；长史辅助模型对近端指数加权。
-· 小样本：强正则、降维（单因子）、简单组合、共形区间；复杂件须经回测挣得入选资格。
+· 制度漂移：训练窗口锁 2015+，不纳入关系已失效的更早样本。
+· 小样本：强正则（Ridge/PLS 密集收缩）、降维（单因子）、简单组合、共形区间；
+  复杂件（如 LightGBM）须经回测打赢 AR 才纳入，实验显示通常被剔除。
 · 数据口径限制（务必知悉）：本仓库仅有单一 vintage 快照，历史高频/月度值可能已被
   修订，故回测为"伪实时（pseudo-real-time）"——能准确复现"发布时点的参差边缘"，
   但用的是修订后数值；要做"真实时（true real-time）"需接入 point-in-time 历史档案。
@@ -60,7 +61,7 @@
 依赖
 ----
 必需：pandas, numpy, scikit-learn, matplotlib, openpyxl
-可选：lightgbm（缺失则自动跳过挑战者），statsmodels（缺失则跳过 ADF 体检项）
+可选：lightgbm（缺失则自动跳过挑战者模型）
 
 运行
 ----
@@ -74,7 +75,7 @@ from __future__ import annotations
 import os
 import sys
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -95,20 +96,13 @@ from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 
-# 可选依赖
+# 可选依赖：lightgbm（缺失则自动跳过挑战者模型，不影响主流程）
 try:
     import lightgbm as lgb
 
     _HAS_LGBM = True
 except Exception:  # pragma: no cover
     _HAS_LGBM = False
-
-try:
-    from statsmodels.tsa.stattools import adfuller
-
-    _HAS_SM = True
-except Exception:  # pragma: no cover
-    _HAS_SM = False
 
 
 RNG_SEED = 20260525
@@ -158,9 +152,9 @@ INDICATORS: List[Indicator] = [
     Indicator("tire_fullsteel",    "中国:开工率:汽车轮胎(全钢胎)",              "周度", "HF", "mtd_yoy", "全钢胎开工"),
     Indicator("polyester_chip",    "中国:开工率:聚酯切片",                     "周度", "HF", "mtd_yoy", "聚酯切片开工"),
     Indicator("asphalt",           "中国:开工率:石油沥青装置",                  "周度", "HF", "mtd_yoy", "石油沥青开工"),
-    Indicator("rebar_output",      "中国:产量:螺纹钢:主要钢厂",                 "周度", "HF", "mtd_yoy", "螺纹钢产量", agg="sum"),
+    Indicator("rebar_output",      "中国:产量:螺纹钢:主要钢厂",                 "周度", "HF", "mtd_yoy", "螺纹钢产量"),
     Indicator("rebar_oprate",      "中国:开工率:螺纹钢:主要钢厂",               "周度", "HF", "mtd_yoy", "螺纹钢开工"),
-    Indicator("land_area",         "中国:100大中城市:成交土地占地面积",          "周度", "HF", "mtd_yoy", "成交土地面积", agg="sum"),
+    Indicator("land_area",         "中国:100大中城市:成交土地占地面积",          "周度", "HF", "mtd_yoy", "成交土地面积"),
     Indicator("scfi",              "中国:上海出口集装箱运价指数:综合指数",        "周度", "HF", "mtd_yoy", "SCFI综合"),
     Indicator("steel_priceidx",    "中国:钢材综合价格指数",                    "周度", "HF", "mtd_yoy", "钢材价格指数"),
     Indicator("coal_south",        "中国:南方电厂:日耗量:煤炭",                 "周度", "HF", "mtd_yoy", "南方电厂煤耗"),
@@ -176,14 +170,14 @@ INDICATORS: List[Indicator] = [
 
     # ---------------- 日度（高频 → MTD 同比） ----------------
     Indicator("pta",               "中国:开工率:精对苯二甲酸",                  "日度", "HF", "mtd_yoy", "PTA开工"),
-    Indicator("home_sales30",      "中国:30大中城市:成交面积:商品房",            "日度", "HF", "mtd_yoy", "30城商品房成交", agg="sum"),
+    Indicator("home_sales30",      "中国:30大中城市:成交面积:商品房",            "日度", "HF", "mtd_yoy", "30城商品房成交"),
     Indicator("bdi",               "波罗的海干散货指数(BDI)",                   "日度", "HF", "mtd_yoy", "BDI"),
     Indicator("nanhua",            "南华综合指数",                            "日度", "HF", "mtd_yoy", "南华综合指数"),
     Indicator("rebar_price",       "中国:价格:螺纹钢(HRB400E,20mm)",          "日度", "HF", "mtd_yoy", "螺纹钢价格"),
     Indicator("cement_priceidx",   "中国:水泥价格指数",                        "日度", "HF", "mtd_yoy", "水泥价格指数"),
-    Indicator("port_qhd",          "中国:秦皇岛港:港口吞吐量:煤炭",             "日度", "HF", "mtd_yoy", "秦皇岛港煤炭", agg="sum"),
-    Indicator("port_cfd",          "中国:曹妃甸港:煤炭调度:港口吞吐量",          "日度", "HF", "mtd_yoy", "曹妃甸港煤炭", agg="sum"),
-    Indicator("port_jt",           "中国:京唐老港:港口吞吐量:煤炭",             "日度", "HF", "mtd_yoy", "京唐老港煤炭", agg="sum"),
+    Indicator("port_qhd",          "中国:秦皇岛港:港口吞吐量:煤炭",             "日度", "HF", "mtd_yoy", "秦皇岛港煤炭"),
+    Indicator("port_cfd",          "中国:曹妃甸港:煤炭调度:港口吞吐量",          "日度", "HF", "mtd_yoy", "曹妃甸港煤炭"),
+    Indicator("port_jt",           "中国:京唐老港:港口吞吐量:煤炭",             "日度", "HF", "mtd_yoy", "京唐老港煤炭"),
 ]
 
 
@@ -195,8 +189,7 @@ class Config:
     out_dir: str = "outputs"
 
     # 样本窗口
-    main_window_start: str = "2015-01"   # 主模型窗口起点
-    long_window_start: str = "2005-01"   # 长史辅助参照起点
+    main_window_start: str = "2015-01"   # 主模型训练窗口起点（现行指标-目标关系最一致）
     design_start: str = "2003-01"        # 设计矩阵起点（含一年提前量供 YoY/AR 计算）
 
     # 预测日切口（day-of-month）。None=自动取数据中高频最新日期的 day。
@@ -219,13 +212,11 @@ class Config:
     min_coverage: float = 0.60           # 主窗口内最低非缺失比例
     min_years: float = 4.0               # 最短历史年数
 
-    # 因子
-    n_factors: int = 1                   # 单因子（小样本：至多 2）
+    # 因子（PCA 因子为无监督，不接触 y，故不会对目标过拟合；个数依方差占比定，
+    # 实验显示前 2 主成分解释约 66%，单因子已能概括主要共同景气，默认 1）
+    n_factors: int = 1
     factor_max_iter: int = 100
     factor_tol: float = 1e-6
-
-    # 长史辅助模型近端指数加权半衰期（月）
-    long_halflife_months: float = 60.0
 
     exclude_months: Tuple[int, ...] = (1, 2)  # 主模型剔除的月份
 
@@ -281,12 +272,14 @@ def _mtd_yoy(df: pd.DataFrame, name: str, as_of: pd.Timestamp, as_of_day: int,
     高频指标 → "月初至今对齐同比（MTD-YoY）"，Period[M] 索引。
     口径：每个自然月取『1 号至 as_of_day 号』窗口内的聚合，再与去年同月同一日切口比较。
 
-    聚合方式由各指标显式声明（Indicator.agg），不再"一刀切取均值"：
-      · 'mean' —— 用于率/价/指数/日均型（开工率、价格指数、BDI、日均产量/销量等）：
-                  取窗口内观测的均值（= 平均日/周强度），对窗口内观测个数差异稳健。
-      · 'sum'  —— 用于可加的流量/总量型（成交面积、成交土地、港口吞吐量等）：
-                  取窗口内求和（月度总量口径）。两年同用 [1..as_of_day] 同一日切口，
-                  使 YoY 比较口径一致。
+    聚合方式由各指标显式声明（Indicator.agg），默认且推荐 'mean'：
+      · 'mean'（默认/推荐）—— 取窗口内观测均值（= 平均日/周强度）。对"窗口内观测个数"
+                  差异稳健，因此**不产生机械同比**：即使今年窗口落入 3 个周度点、去年落入
+                  4 个，均值仍可比；而日历月天数逐年基本不变，故均值同比≈总量同比。
+      · 'sum'  —— 仅在确知观测个数逐年稳定（如逐日无缺的日度序列）时才可用于总量型。
+                  对周度等"窗口内点数逐年波动"的流量，求和会被点数差异污染，产生
+                  机械同比（实验已证实：周度成交土地 sum 同比相关 0.19 < mean 的 0.33），
+                  故此处统一采用 mean。
     口径稳健性保护：窗口内观测个数过少的月份（< 该指标月度观测中位数的 min_frac，
     且 < 1）置为缺失，避免"薄窗口 vs 去年整窗"的口径偏差污染 YoY。
     训练/服务/回测共用同一 as_of_day，确保无前视偏差。
@@ -374,7 +367,6 @@ def screen_features(design: pd.DataFrame, train_idx: pd.PeriodIndex,
     keep = ["AR1", "SEAS12"]
     dropped: List[Tuple[str, str]] = []
     sub = design.loc[train_idx]
-    n = len(sub)
     for c in feature_columns(design):
         if c in ("AR1", "SEAS12"):
             continue
@@ -456,16 +448,12 @@ class EMFactor:
 # 五、模型族（统一接口 fit / predict），均含训练内预处理，防泄漏
 # =============================================================================
 class _OLS:
-    """带截距的最小二乘；支持样本权重（用于长史近端加权）。"""
+    """带截距的普通最小二乘（用于 AR 基准与因子桥接回归的小型回归）。"""
 
-    def fit(self, X: np.ndarray, y: np.ndarray, w: Optional[np.ndarray] = None) -> "_OLS":
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "_OLS":
         X = np.asarray(X, float)
         A = np.column_stack([np.ones(len(X)), X])
-        if w is None:
-            coef, *_ = np.linalg.lstsq(A, y, rcond=None)
-        else:
-            sw = np.sqrt(w)
-            coef, *_ = np.linalg.lstsq(A * sw[:, None], y * sw, rcond=None)
+        coef, *_ = np.linalg.lstsq(A, y, rcond=None)
         self.coef_ = coef
         return self
 
@@ -597,6 +585,9 @@ class PLSModel:
 
     name = "PLS"
 
+    def __init__(self, cfg: Config):
+        self.cfg_components = cfg.pls_components
+
     def fit(self, design, cols, train_idx):
         self.cols = cols
         sub = design.loc[train_idx]
@@ -612,9 +603,6 @@ class PLSModel:
         ])
         self.pipe.fit(X, y)
         return self
-
-    def __init__(self, cfg: Config):
-        self.cfg_components = cfg.pls_components
 
     def predict_row(self, design, cols, period):
         x = design.loc[[period], self.cols].values
@@ -716,7 +704,7 @@ def walk_forward(frames: Dict[str, pd.DataFrame], cfg: Config,
             try:
                 model.fit(design, cols, train_idx)
                 rec[model.name] = model.predict_row(design, cols, p)
-            except Exception as e:  # 单模型失败不致全盘崩溃
+            except Exception:  # 单模型失败不致全盘崩溃
                 rec[model.name] = np.nan
         rows.append(rec)
     bt = pd.DataFrame(rows).set_index("period")
@@ -982,7 +970,7 @@ def run(cfg: Config) -> Dict:
         return rmse, mae, dacc
 
     print(f"  回测区间: {bt.index.min()} ~ {bt.index.max()}  共 {len(bt)} 期（非 1-2 月）")
-    print(f"  各模型为逐期样本外预测；组合为在线扩展窗权重（无未来泄漏）。")
+    print("  各模型为逐期样本外预测；组合为在线扩展窗权重（无未来泄漏）。")
     print(f"  {'模型':<22s}{'RMSE':>8}{'MAE':>8}{'方向准确率':>12}{'最终权重':>10}")
     print("  " + "-" * 60)
     for n in bt.attrs["model_names"]:
